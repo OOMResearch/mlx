@@ -83,7 +83,8 @@ template <typename T>
   P[sbase + col] = static_cast<T>(pv);
 }
 
-template <typename T, bool Accum>
+// Rows before final_rows are complete and go to out, the rest stay in acc.
+template <typename T>
 [[kernel]] void sdpa_vjp_reduce(
     const device T* src [[buffer(0)]],
     device float* acc [[buffer(1)]],
@@ -93,6 +94,8 @@ template <typename T, bool Accum>
     const constant int& group [[buffer(5)]],
     const constant int& acc_rows [[buffer(6)]],
     const constant int& row_off [[buffer(7)]],
+    const constant int& accum [[buffer(8)]],
+    const constant int& final_rows [[buffer(9)]],
     uint3 gid [[thread_position_in_grid]]) {
   int c = int(gid.x);
   int row = int(gid.y);
@@ -112,9 +115,14 @@ template <typename T, bool Accum>
   size_t ai =
       (size_t(bh) * size_t(acc_rows) + size_t(row_off + row)) * size_t(dim) +
       size_t(c);
-  float total = Accum ? acc[ai] + sum : sum;
-  acc[ai] = total;
-  out[ai] = static_cast<T>(total);
+  if (accum != 0) {
+    sum += acc[ai];
+  }
+  if (row < final_rows) {
+    out[ai] = static_cast<T>(sum);
+  } else {
+    acc[ai] = sum;
+  }
 }
 
 // Instantiations
@@ -143,11 +151,8 @@ instantiate_sdpa_vjp_ds(float, float);
 instantiate_sdpa_vjp_ds(float16_t, float16_t);
 instantiate_sdpa_vjp_ds(bfloat16_t, bfloat16_t);
 
-#define instantiate_sdpa_vjp_reduce(tname, type)                 \
-  instantiate_kernel(                                            \
-      "sdpa_vjp_reduce_add_" #tname, sdpa_vjp_reduce, type, true) \
-  instantiate_kernel(                                            \
-      "sdpa_vjp_reduce_set_" #tname, sdpa_vjp_reduce, type, false)
+#define instantiate_sdpa_vjp_reduce(tname, type) \
+  instantiate_kernel("sdpa_vjp_reduce_" #tname, sdpa_vjp_reduce, type)
 
 instantiate_sdpa_vjp_reduce(float, float);
 instantiate_sdpa_vjp_reduce(float16_t, float16_t);
