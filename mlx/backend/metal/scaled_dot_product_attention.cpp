@@ -1107,13 +1107,17 @@ array vjp_row_slice(const array& x, int t0, int len) {
 // Block sizes for the score tile. The best results are usually for 1024x1024 so
 // I set those as default. This probably depends on the hardware so it may need
 // to be tuned in the future.
-std::pair<int, int> sdpa_vjp_blocks(int B, int H, int qL, int kL, Dtype ctype) {
+// Under a causal mask a block of keys is only seen by the queries from its
+// first key on, so narrower key blocks skip more of the masked scores.
+std::pair<int, int>
+sdpa_vjp_blocks(int B, int H, int qL, int kL, Dtype ctype, bool causal) {
   constexpr int kDefaultBlock = 1024;
+  constexpr int kCausalKeyBlock = 256;
 
   int blk = env::get_var("MLX_SDPA_VJP_BLOCK", kDefaultBlock);
 
   int bq = std::min(blk, qL);
-  int bk = std::min(blk, kL);
+  int bk = std::min(causal ? std::min(blk, kCausalKeyBlock) : blk, kL);
   if (int e = env::get_var("MLX_SDPA_VJP_BQ", 0); e > 0) {
     bq = std::min(e, qL);
   }
@@ -1153,14 +1157,13 @@ void sdpa_vjp_blocked(
   // nonzero whenever the queries are a suffix of the keys.
   const int diag_off = kL - qL;
 
-  auto [BQ, BK] = sdpa_vjp_blocks(B, H, qL, kL, q.dtype());
+  auto [BQ, BK] = sdpa_vjp_blocks(B, H, qL, kL, q.dtype(), causal);
 
   Dtype ctype = q.dtype();
   std::string tname = get_type_string(ctype);
 
   auto ds_kernel = d.get_kernel("sdpa_vjp_ds_" + tname);
-  auto red_add = d.get_kernel("sdpa_vjp_reduce_add_" + tname);
-  auto red_set = d.get_kernel("sdpa_vjp_reduce_set_" + tname);
+  auto reduce_kernel = d.get_kernel("sdpa_vjp_reduce_" + tname);
 
   // Temporary tiles
   array s_buf = vjp_alloc({BH, BQ, BK}, ctype, s);
@@ -1179,6 +1182,9 @@ void sdpa_vjp_blocked(
 
   std::vector<array> copies;
 
+  // Adds a tile to the rows it covers. The first `final_rows` rows get no
+  // more tiles after this one and are written to the output. The others are
+  // kept in the float32 accumulator.
   auto run_reduce = [&](const array& src,
                         array& acc,
                         array& out,
@@ -1188,8 +1194,9 @@ void sdpa_vjp_blocked(
                         int acc_rows,
                         int row_off,
                         int nbh,
-                        bool accum) {
-    compute_encoder.set_compute_pipeline_state(accum ? red_add : red_set);
+                        bool accum,
+                        int final_rows) {
+    compute_encoder.set_compute_pipeline_state(reduce_kernel);
     compute_encoder.set_input_array(src, 0);
     compute_encoder.set_input_array(acc, 1);
     compute_encoder.set_output_array(acc, 1);
@@ -1199,11 +1206,11 @@ void sdpa_vjp_blocked(
     compute_encoder.set_bytes(group, 5);
     compute_encoder.set_bytes(acc_rows, 6);
     compute_encoder.set_bytes(row_off, 7);
+    compute_encoder.set_bytes(accum ? 1 : 0, 8);
+    compute_encoder.set_bytes(final_rows, 9);
     compute_encoder.dispatch_threads(
         MTL::Size(dim, rows, nbh), MTL::Size(std::min(dim, 32), 8, 1));
   };
-
-  const int n_i = (qL + BQ - 1) / BQ;
 
   const Strides q_bs = {
       H * int64_t(qL) * D, G * int64_t(qL) * D, int64_t(qL) * D};
@@ -1214,21 +1221,27 @@ void sdpa_vjp_blocked(
   const Strides v_bs = {Hk * int64_t(kL) * Dv, int64_t(kL) * Dv, 0};
   const Shape bshape = {B, Hk, G};
 
+  // The first query a key can be seen by.
+  auto first_query = [&](int j) {
+    return causal ? std::clamp(j - diag_off, 0, qL) : 0;
+  };
+
   for (int j0 = 0; j0 < kL; j0 += BK) {
     const int bk_len = std::min(BK, kL - j0);
+    const bool last_keys = j0 + bk_len >= kL;
 
     array k_sl = vjp_row_slice(k, j0, bk_len);
     array v_sl = vjp_row_slice(v, j0, bk_len);
 
-    bool kv_accum = false;
+    // The queries before i_begin do not see this key block. The first block
+    // takes every query so that fully masked rows also get a dQ.
+    const int i_begin = j0 == 0 ? 0 : first_query(j0);
+    // The queries before i_final do not see the next key block.
+    const int i_final = last_keys ? qL : first_query(j0 + bk_len);
 
-    for (int ii = 0; ii < n_i; ++ii) {
-      const int i0 = ii * BQ;
+    for (int i0 = i_begin; i0 < qL; i0 += BQ) {
       const int bq_len = std::min(BQ, qL - i0);
-      // Skip tiles that lie entirely above the causal diagonal.
-      if (causal && j0 > i0 + bq_len - 1 + diag_off) {
-        continue;
-      }
+      const bool last_queries = i0 + bq_len >= qL;
 
       array q_sl = vjp_row_slice(q, i0, bq_len);
       array o_sl = vjp_row_slice(cot_o, i0, bq_len);
@@ -1360,11 +1373,14 @@ void sdpa_vjp_blocked(
           o_bs);
 
       // dQ[i0] += dQ_tile, dK[j0] += sum_G dK_tile, dV[j0] += sum_G dV_tile
-      run_reduce(dq_v, dq_acc, dq, bq_len, D, 1, qL, i0, BH, j0 != 0);
-      run_reduce(dk_v, dk_acc, dk, bk_len, D, G, kL, j0, BHk, kv_accum);
-      run_reduce(dv_v, dv_acc, dv, bk_len, Dv, G, kL, j0, BHk, kv_accum);
-
-      kv_accum = true;
+      const int q_final = std::clamp(i_final - i0, 0, bq_len);
+      const int k_final = last_queries ? bk_len : 0;
+      const bool kv_accum = i0 != i_begin;
+      run_reduce(dq_v, dq_acc, dq, bq_len, D, 1, qL, i0, BH, j0 != 0, q_final);
+      run_reduce(
+          dk_v, dk_acc, dk, bk_len, D, G, kL, j0, BHk, kv_accum, k_final);
+      run_reduce(
+          dv_v, dv_acc, dv, bk_len, Dv, G, kL, j0, BHk, kv_accum, k_final);
     }
   }
 
