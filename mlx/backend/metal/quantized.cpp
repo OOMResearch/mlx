@@ -932,6 +932,58 @@ void qmm_nax(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+
+void qmm_n_splitk_nax(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const array& biases,
+    array& out,
+    int group_size,
+    int M,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s) {
+  constexpr int splits = 4;
+  constexpr int bm = 256, bn = 64, bk = 128, wm = 4, wn = 2;
+  int chunk = ((K + splits * bk - 1) / (splits * bk)) * bk;
+  auto& encoder = metal::get_command_encoder(s);
+  array partials({splits, M, N}, float32, nullptr, {});
+  partials.set_data(allocator::malloc(partials.nbytes()));
+  encoder.add_temporary(partials);
+
+  std::string name = "affine_qmm_n_splitk_nax_bfloat16_t_gs_" +
+      std::to_string(group_size) + "_b_4";
+  auto kernel = get_qmm_nax_kernel_wrapped(
+      d, name, "qmm_n_splitk_nax", "affine", "bfloat16_t",
+      group_size, 4, bm, bk, bn, wm, wn);
+  encoder.set_compute_pipeline_state(kernel);
+  encoder.set_input_array(w, 0);
+  encoder.set_input_array(scales, 1);
+  encoder.set_input_array(biases, 2);
+  encoder.set_input_array(x, 3);
+  encoder.set_output_array(partials, 4);
+  encoder.set_bytes(K, 5);
+  encoder.set_bytes(N, 6);
+  encoder.set_bytes(M, 7);
+  encoder.set_bytes(chunk, 8);
+  encoder.dispatch_threadgroups(
+      MTL::Size((N + bn - 1) / bn, (M + bm - 1) / bm, splits),
+      MTL::Size(32, wn, wm));
+
+  name = "affine_qmm_n_splitk_accum_bfloat16_t";
+  auto definition = get_template_definition(
+      name, "affine_qmm_n_splitk_accum", "bfloat16_t");
+  kernel = get_qmm_nax_kernel(d, name, definition, "affine");
+  encoder.set_compute_pipeline_state(kernel);
+  encoder.set_input_array(partials, 0);
+  encoder.set_output_array(out, 1);
+  int size = M * N;
+  encoder.set_bytes(size, 2);
+  encoder.dispatch_threads(MTL::Size(size, 1, 1), MTL::Size(256, 1, 1));
+}
+
 void gather_qmm_nax(
     const array& x,
     const array& w,
@@ -1068,6 +1120,15 @@ void qmm(
   bool nax_aligned = (K % 64 == 0) && (transpose || N % 64 == 0);
   if (has_nax_kernel && nax_aligned &&
       (env::enable_tf32() || x.dtype() != float32)) {
+    // Bound the float32 partial buffer to 128 MiB for long reductions.
+    if (!transpose && mode == "affine" && x.dtype() == bfloat16 &&
+        bits == 4 && (group_size == 64 || group_size == 128) &&
+        w.ndim() == 2 && x.flags().row_contiguous && biases &&
+        M >= 64 && K >= 32768 && K % 128 == 0 &&
+        size_t(M) * N * 4 * sizeof(float) <= (128ul << 20)) {
+      return qmm_n_splitk_nax(
+          x, w, scales, *biases, out, group_size, M, N, K, d, s);
+    }
     return qmm_nax(
         /* const array& x = */ x,
         /* const array& w = */ w,

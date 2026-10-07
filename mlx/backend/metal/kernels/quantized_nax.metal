@@ -110,3 +110,8 @@
   instantiate_quantized_groups(8)
 
 instantiate_quantized_all() // clang-format on
+
+
+instantiate_quantized(affine_qmm_n_splitk_nax, bfloat16_t, 64, 4, 256, 64, 128, 4, 2)
+instantiate_quantized(affine_qmm_n_splitk_nax, bfloat16_t, 128, 4, 256, 64, 128, 4, 2)
+instantiate_kernel("affine_qmm_n_splitk_accum_bfloat16_t", affine_qmm_n_splitk_accum, bfloat16_t)

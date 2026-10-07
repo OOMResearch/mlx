@@ -1071,13 +1071,14 @@ template <
     const int BK = 64,
     const int BN = 64,
     const int WM = 2,
-    const int WN = 2>
+    const int WN = 2,
+    typename OutT = T>
 METAL_FUNC void qmm_n_nax_tgp_impl(
     const device uint32_t* w,
     const device T* scales,
     const device T* biases,
     const device T* x,
-    device T* y,
+    device OutT* y,
     threadgroup T* Ws,
     const constant int& K,
     const constant int& N,
@@ -1085,7 +1086,9 @@ METAL_FUNC void qmm_n_nax_tgp_impl(
     uint3 tid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    int k_start = 0,
+    int k_end = -1) {
   (void)lid;
 
   static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
@@ -1114,9 +1117,10 @@ METAL_FUNC void qmm_n_nax_tgp_impl(
 
   // Here w is [K, N]: packed and group-quantized along N, with row stride N.
   x += y_row * static_cast<int64_t>(K);
-  wl += y_col * bytes_per_pack / pack_factor;
-  scales += y_col / group_size;
-  biases += y_col / group_size;
+  wl += y_col * bytes_per_pack / pack_factor +
+      size_t(k_start) * N * bytes_per_pack / pack_factor;
+  scales += y_col / group_size + size_t(k_start) * (N / group_size);
+  biases += y_col / group_size + size_t(k_start) * (N / group_size);
   y += y_row * static_cast<int64_t>(N) + y_col;
 
   // Make the weight loader
@@ -1145,9 +1149,10 @@ METAL_FUNC void qmm_n_nax_tgp_impl(
   NAXTile<AccumType, TM, TN> Dtile;
   Dtile.clear();
 
-  x += tm * K;
+  x += tm * K + k_start;
 
-  for (int k = 0; k < K; k += BK) {
+  const int k_limit = k_end < 0 ? K : k_end;
+  for (int k = k_start; k < k_limit; k += BK) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     loader_w.load_unsafe();
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1664,4 +1669,51 @@ template <
       }
     });
   });
+}
+
+
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    const int BM = 256,
+    const int BK = 128,
+    const int BN = 64,
+    const int WM = 4,
+    const int WN = 2>
+[[kernel]] void affine_qmm_n_splitk_nax(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device float* partials [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const constant int& M [[buffer(7)]],
+    const constant int& chunk [[buffer(8)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  threadgroup T Ws[BK * (BN + 16 / sizeof(T))];
+  int k_start = int(tid.z) * chunk;
+  int k_end = min(k_start + chunk, K);
+  partials += size_t(tid.z) * M * N;
+  qmm_n_nax_tgp_impl<T, group_size, bits, BM, BK, BN, WM, WN, float>(
+      w, scales, biases, x, partials, Ws, K, N, M,
+      uint3(tid.xy, 0), lid, simd_gid, simd_lid, k_start, k_end);
+}
+
+template <typename T>
+[[kernel]] void affine_qmm_n_splitk_accum(
+    const device float* partials [[buffer(0)]],
+    device T* out [[buffer(1)]],
+    const constant int& size [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+  if (index < size) {
+    float sum = partials[index] + partials[size + index];
+    sum += partials[2 * size + index];
+    sum += partials[3 * size + index];
+    out[index] = T(sum);
+  }
 }
