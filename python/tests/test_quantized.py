@@ -20,6 +20,66 @@ def is_m1_mac():
 
 
 class TestQuantized(mlx_tests.MLXTestCase):
+    def test_untransposed_long_reduction(self):
+        if not mx.metal.is_available():
+            self.skipTest("Requires Metal")
+        mx.random.seed(19)
+        cases = [
+            (64, 32768, 64, 64),
+            (65, 32896, 128, 64),
+            (257, 33024, 256, 128),
+            (33, 32768, 128, 64),
+            (64, 32832, 128, 64),
+            (64, 32768, 96, 32),
+            (2049, 32768, 4096, 64),
+        ]
+        for m, k, n, gs in cases:
+            with self.subTest(m=m, k=k, n=n, group_size=gs):
+                w = mx.random.normal((k, n)).astype(mx.bfloat16)
+                packed, scales, biases = mx.quantize(w, group_size=gs, bits=4)
+                x = mx.random.normal((m, k)).astype(mx.bfloat16)
+                dense = mx.dequantize(packed, scales, biases, group_size=gs, bits=4)
+
+                def backward(x):
+                    return mx.quantized_matmul(
+                        x,
+                        packed,
+                        scales,
+                        biases,
+                        transpose=False,
+                        group_size=gs,
+                        bits=4,
+                    )
+
+                mx.eval(x, packed, scales, biases, dense)
+                mx.reset_peak_memory()
+                before = mx.get_active_memory()
+                actual = backward(x)
+                mx.eval(actual)
+                if m > 512:
+                    self.assertLess(mx.get_peak_memory() - before, 128 << 20)
+                check_rows = 2 if m > 512 else m
+                reference = mx.matmul(
+                    x[:check_rows].astype(mx.float32),
+                    dense.astype(mx.float32),
+                    stream=mx.cpu,
+                )
+                error = mx.linalg.norm(
+                    actual[:check_rows].astype(mx.float32) - reference
+                )
+                relative_error = error / mx.linalg.norm(reference)
+                self.assertLess(relative_error.item(), 0.01)
+                self.assertTrue(mx.all(mx.isfinite(actual)).item())
+                self.assertTrue(mx.array_equal(mx.compile(backward)(x), actual).item())
+
+                def forward(y):
+                    return mx.quantized_matmul(
+                        y, packed, scales, biases, transpose=True, group_size=gs, bits=4
+                    )
+
+                _, gradients = mx.vjp(forward, [mx.zeros((m, n), mx.bfloat16)], [x])
+                self.assertTrue(mx.array_equal(gradients[0], actual).item())
+
     def test_quantize_dequantize(self):
         w = mx.random.normal(shape=(128, 512))
         for gs in [32, 64, 128]:
