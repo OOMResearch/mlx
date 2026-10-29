@@ -4204,15 +4204,29 @@ class TestOps(mlx_tests.MLXTestCase):
                 out_mlx = getattr(mx, op)(a_mlx, b_mlx)
                 out_np = getattr(np, op)(a_np, b_np)
                 self.assertTrue(np.array_equal(np.array(out_mlx), out_np))
-        for op in ["left_shift", "right_shift"]:
-            for t in types:
-                a_mlx = a.astype(t)
-                b_mlx = mx.random.randint(0, t.size, (1000,)).astype(t)
+        for t in types:
+            width = t.size * 8
+            signed = mx.issubdtype(t, mx.signedinteger)
+            counts = [0, 1, width - 1, width, width + 1]
+            if signed:
+                counts.extend([-1, -width + 1, -width, -width - 1])
+            values = [0, 1, 5, -1, -5] if signed else [0, 1, 5]
+            cases = [
+                (a.astype(t), mx.random.randint(0, width, (1000,)).astype(t)),
+                (
+                    mx.array(values, dtype=t)[:, None],
+                    mx.array(counts, dtype=t)[None, :],
+                ),
+            ]
+            for case, (a_mlx, b_mlx) in enumerate(cases):
                 a_np = np.array(a_mlx)
                 b_np = np.array(b_mlx)
-                out_mlx = getattr(mx, op)(a_mlx, b_mlx)
-                out_np = getattr(np, op)(a_np, b_np)
-                self.assertTrue(np.array_equal(np.array(out_mlx), out_np))
+                for op in ["left_shift", "right_shift"]:
+                    with self.subTest(dtype=t, op=op, case=case):
+                        expected = getattr(np, op)(a_np, b_np)
+                        actual = getattr(mx, op)(a_mlx, b_mlx)
+                        self.assertEqual(actual.dtype, t)
+                        np.testing.assert_array_equal(np.array(actual), expected)
 
         for t in types:
             a_mlx = a.astype(t)
@@ -4876,6 +4890,25 @@ class TestOps(mlx_tests.MLXTestCase):
         # The carry must not fire one byte early: 0x7e/0xfe stay finite
         finite = mx.from_fp8(mx.array([0x7E, 0xFE], dtype=mx.uint8), mx.float32)
         self.assertTrue(mx.array_equal(finite, mx.array([448.0, -448.0])))
+
+        for dt in [mx.float32, mx.float16, mx.bfloat16]:
+            nan_arr = mx.array([float("nan"), -float("nan")], dtype=dt)
+            fp8_nan = mx.to_fp8(nan_arr)
+            self.assertEqual(fp8_nan[0].item(), 0x7F)
+            self.assertIn(fp8_nan[1].item(), [0x7F, 0xFF])
+
+            back = mx.from_fp8(fp8_nan, dtype=dt)
+            self.assertTrue(mx.isnan(back[0]).item())
+            self.assertTrue(mx.isnan(back[1]).item())
+
+            overflow_arr = mx.array([float("inf"), -float("inf"), 1e5, -1e5], dtype=dt)
+            fp8_sat = mx.to_fp8(overflow_arr)
+            self.assertTrue(
+                mx.array_equal(
+                    fp8_sat,
+                    mx.array([0x7E, 0xFE, 0x7E, 0xFE], dtype=mx.uint8),
+                )
+            )
 
     def test_zeros_ones_empty_like_dtype(self):
         x = mx.array([1, 2, 3], dtype=mx.int32)
